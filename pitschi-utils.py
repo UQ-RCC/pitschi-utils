@@ -82,6 +82,153 @@ def ppms_ad_func(args):
     emails_file.close()
 
 
+
+
+def get_projects(ppms_url:str, puma_key: str):
+    logger.debug("Querying projects")
+    url = f"{ppms_url}pumapi/"
+    payload=f"apikey={puma_key}&action=getprojects&active=true&format=json"
+    headers = {
+      'Content-Type': 'application/x-www-form-urlencoded'
+    }
+    response = requests.request("POST", url, headers=headers, data=payload)
+    if response.ok:
+        if response.status_code == 204:
+            return []
+        else:
+            return response.json(strict=False)
+    else:
+        return []
+
+
+def get_project_user(ppms_url:str, puma_key: str, projectid: int):
+    logger.debug("Querying project user")
+    url = f"{ppms_url}pumapi/"
+    payload=f"apikey={puma_key}&action=getprojectusers&withdeactivated=false&projectid={projectid}"
+    headers = {
+      'Content-Type': 'application/x-www-form-urlencoded'
+    }
+    response = requests.request("POST", url, headers=headers, data=payload)
+    if response.ok:
+        if response.status_code == 204:
+            return []
+        else:
+            response_txt = response.text
+            return response_txt.strip().split("\n")
+    else:
+        return []
+
+def get_ppms_user(ppms_url:str, puma_key: str, login: str):
+    url = f"{ppms_url}pumapi/"
+    payload=f"apikey={puma_key}&action=getuser&login={login}&format=json"
+    headers = {
+      'Content-Type': 'application/x-www-form-urlencoded'
+    }
+    response = requests.request("POST", url, headers=headers, data=payload)
+    if response.ok:
+        if response.status_code == 204:
+            raise Exception('Not found')
+        else:
+            return response.json(strict=False)
+    else:
+        raise Exception('Not found')
+
+def get_rdm_collection(ppms_url:str, api2_key: str, qcollection_action: str, q_collection_field: str, coreid: int, projectid: int):
+    url = f"{ppms_url}API2/"
+    payload=f"apikey={api2_key}&action={qcollection_action}&projectId={projectid}&coreid={coreid}&outformat=json"
+    headers = {
+      'Content-Type': 'application/x-www-form-urlencoded'
+    }
+    response = requests.request("POST", url, headers=headers, data=payload)
+    if response.ok:
+        if response.status_code == 204:
+            return ""
+        qcollection = ""
+        if len(response.json()) > 0:
+            resp = response.json(strict=False)
+            qcollection = resp[0].get(q_collection_field)
+        return qcollection
+    return ""
+
+
+def ppms_proj_ad_func(args):
+    if not args.ad_host or not args.ad_bind or not args.ad_pass or not args.ad_base:
+        logger.error("AD info cannot be empty")
+        sys.exit(1)
+    if not args.ppms_url or not args.puma_key:
+        logger.error("PPMS info cannot be empty")
+        sys.exit(1)
+    
+    projects = get_projects(args.ppms_url, args.puma_key)
+    # logger.info("---------------Projects ------------------------")
+    # logger.info(projects)
+    relevantUsers = {}
+    user_emails_file = open(r"ppms_rdm_project_emails.txt","w")
+    user_emails_file.write("ppms_username,ppms_email,ppms_project\n")
+    for project in projects:
+        if project.get('ProjectRef') < 54:
+            continue
+        # elif project.get('ProjectRef') > 54:
+        #     break
+        logger.info(f"Checking project {project.get('ProjectRef')} - {project.get('ProjectName')}")
+        rdm_collection = get_rdm_collection(args.ppms_url, args.api2_key, 'Report75', 'UQRDM Collection #', 2, project.get('ProjectRef'))
+        logger.info(f"RDM={rdm_collection}")
+        if rdm_collection != None and rdm_collection.strip() != '':
+            logger.info(f"Project {project.get('ProjectRef')} has collection")
+            users = get_project_user(args.ppms_url, args.puma_key, project.get('ProjectRef'))
+            for user in users:
+                user = user.strip()
+                if user != '':
+                    userInfo = get_ppms_user(args.ppms_url, args.puma_key, user)
+                    relevantUsers[user] = userInfo.get('email')
+                    user_emails_file.write(f"{user},{userInfo.get('email')},{project.get('ProjectRef')}\n")
+        else:
+            logger.info(f"No RDM -  ignrored")
+    user_emails_file.close()
+    # done looping through
+    mismatch_emails_file = open(r"ppms_rdm_mismatched_emails.txt","w")
+    mismatch_emails_file.write("ppms_username,ppms_email,ad_email\n")
+    try:
+        ad_connection = connect_to_ad(args.ad_host, args.ad_bind, args.ad_pass)
+    except ldap.INVALID_CREDENTIALS:
+        logger.error ("Your username or password is incorrect.")
+        sys.exit(0)
+    except ldap.LDAPError as e:
+        if type(e.message) == dict and e.message.has_key('desc'):
+            logger.error (e.message['desc'])
+        else: 
+            logger.error (e)
+        sys.exit(0)
+    count = 0
+    for rUser in relevantUsers:
+        if count % 5 ==0:
+            if ad_connection != None:
+                ad_connection.unbind_s()
+            try:
+                ad_connection = connect_to_ad(args.ad_host, args.ad_bind, args.ad_pass)
+            except ldap.INVALID_CREDENTIALS:
+                logger.error ("Your username or password is incorrect.")
+                sys.exit(0)
+            except ldap.LDAPError as e:
+                if type(e.message) == dict and e.message.has_key('desc'):
+                    logger.error (e.message['desc'])
+                else: 
+                    logger.error (e)
+                sys.exit(0)
+        count = count + 1
+        try: 
+            searchFilter =f"(sAMAccountName={rUser})"
+            ad_email = ad_search_email(ad_connection, args.ad_base, searchFilter).decode().strip()
+            print (f"ppms email={relevantUsers[rUser]} ad email={ad_email}")
+            if ad_email != relevantUsers[rUser]:
+                mismatch_emails_file.write(f"{rUser},{relevantUsers[rUser]},{ad_email}\n")
+        except Exception as e:
+            print (e)
+            line = f"{user},NOT FOUND\n"
+    mismatch_emails_file.close()
+
+
+
 def ad_search_email(ad_connection, basedn, searchFilter, searchScope=ldap.SCOPE_SUBTREE, searchAttribute=["mail"]):
     ldap_result_id = ad_connection.search(basedn, searchScope, searchFilter, searchAttribute)
     result_type, result_data = ad_connection.result(ldap_result_id, 0)
@@ -106,8 +253,22 @@ def main(arguments=sys.argv[1:]):
     ppms_ad.add_argument('--ad-bind', help='AD bind address', default=0, type=str)
     ppms_ad.add_argument('--ad-pass', help='AD pass', default=0, type=str)
     ppms_ad.add_argument('--ad-base', help='AD base dn', default=0, type=str)
-    ppms_ad.add_argument('--ppms-url', help='PPMS url', default=0, type=str)
+    ppms_ad.add_argument('--puma-url', help='PPMS url', default=0, type=str)
     ppms_ad.add_argument('--puma-key', help='PPMS puma key', default=0, type=str)
+
+
+    ppms_proj_ad = subparsers.add_parser(
+        'proj-ad', description='Compare PPMS project users and AD users', help='Compare PPMS project users and AD users',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    ppms_proj_ad.set_defaults(func=ppms_proj_ad_func)
+    ppms_proj_ad.add_argument('--ad-host', help='AD host', default=0, type=str)
+    ppms_proj_ad.add_argument('--ad-bind', help='AD bind address', default=0, type=str)
+    ppms_proj_ad.add_argument('--ad-pass', help='AD pass', default=0, type=str)
+    ppms_proj_ad.add_argument('--ad-base', help='AD base dn', default=0, type=str)
+    ppms_proj_ad.add_argument('--ppms-url', help='PPMS url', default=0, type=str)
+    ppms_proj_ad.add_argument('--puma-key', help='PPMS puma key', default=0, type=str)
+    ppms_proj_ad.add_argument('--api2-key', help='api2 key', default=0, type=str)
+
 
     args = parser.parse_args(arguments)
     return args.func(args)
