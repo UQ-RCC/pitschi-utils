@@ -11,6 +11,7 @@ import os, shutil
 import os.path
 import ldap
 import requests
+import csv
 
 logging.basicConfig(level=logging.DEBUG,
                     format='%(asctime)s [%(name)s] %(levelname)s : %(message)s')
@@ -118,6 +119,35 @@ def get_project_user(ppms_url:str, puma_key: str, projectid: int):
     else:
         return []
 
+
+def get_project_members(ppms_url:str, puma_key: str, projectid: int):
+    logger.debug("Querying project members")
+    url = f"{ppms_url}pumapi/"
+    payload=f"apikey={puma_key}&action=getprojectmember&projectid={projectid}"
+    headers = {
+      'Content-Type': 'application/x-www-form-urlencoded'
+    }
+    response = requests.request("POST", url, headers=headers, data=payload)
+    if response.ok:
+        if response.status_code == 204:
+            return []
+        else:
+            response_txt = response.text
+            _csv_reader = csv.reader(response_txt.split('\n'), delimiter=',')
+            _csv_reader.__next__()
+            members = []
+            for row in _csv_reader:
+                if(len(row) > 8):
+                    _userid = int(row[1])
+                    _leader = bool(row[5])
+                    _admin = bool(row[6])
+                    _active = bool(row[7])
+                    _userlogin = row[8]
+                    members.append({'id': _userid, 'login': _userlogin, 'leader': _leader, 'admin': _admin, 'active': _active})
+            return members
+    else:
+        return []
+
 def get_ppms_user(ppms_url:str, puma_key: str, login: str):
     url = f"{ppms_url}pumapi/"
     payload=f"apikey={puma_key}&action=getuser&login={login}&format=json"
@@ -150,6 +180,33 @@ def get_rdm_collection(ppms_url:str, api2_key: str, qcollection_action: str, q_c
         return qcollection
     return ""
 
+def get_user_groups(ppms_url:str, api2_key: str):
+    url = f"{ppms_url}API2/"
+    payload=f"apikey={api2_key}&action=GetUserGroups"
+    headers = {
+      'Content-Type': 'application/x-www-form-urlencoded'
+    }
+    response = requests.request("POST", url, headers=headers, data=payload)
+    if response.ok:
+        if response.status_code == 204:
+            return ""
+        else:
+            return response.json(strict=False)
+    return ""
+
+def get_user_details(ppms_url:str, api2_key: str, userid: int):
+    url = f"{ppms_url}API2/"
+    payload=f"apikey={api2_key}&action=GetUserDetailsById&coreid=2&checkUserId={userid}"
+    headers = {
+      'Content-Type': 'application/x-www-form-urlencoded'
+    }
+    response = requests.request("POST", url, headers=headers, data=payload)
+    if response.ok:
+        if response.status_code == 204:
+            return ""
+        else:
+            return response.json(strict=False)[0]
+    return ""
 
 def ppms_proj_ad_func(args):
     if not args.ad_host or not args.ad_bind or not args.ad_pass or not args.ad_base:
@@ -227,6 +284,46 @@ def ppms_proj_ad_func(args):
             line = f"{user},NOT FOUND\n"
     mismatch_emails_file.close()
 
+def ppms_proj_list_func(args):
+    if not args.ppms_url or not args.puma_key or not args.api2_key :
+        logger.error("PPMS info cannot be empty")
+        sys.exit(1)
+    projects = get_projects(args.ppms_url, args.puma_key)
+    # logger.info("---------------Projects ------------------------")
+    # logger.info(projects)
+    usergroups = get_user_groups(args.ppms_url, args.api2_key)
+    relevantUsers = {}
+    user_emails_file = open(r"ppms_rdm_project_emails.txt","w")
+    user_emails_file.write("projectid, projectname, email, fullname, ci\n")
+    for project in projects:
+        # elif project.get('ProjectRef') > 54:
+        #     break
+        logger.info(f"\n\n==>Checking project {project.get('ProjectRef')} - {project.get('ProjectName')}")
+        rdm_collection = get_rdm_collection(args.ppms_url, args.api2_key, 'Report75', 'UQRDM Collection #', 2, project.get('ProjectRef'))
+        logger.info(f"RDM={rdm_collection}")
+        if rdm_collection != None and rdm_collection.strip() != '':
+            logger.info(f"Project {project.get('ProjectRef')} has collection")
+            members = get_project_members(args.ppms_url, args.puma_key, project.get('ProjectRef'))
+            logger.info(f"members: {members}")
+            for member in members:
+                # if not member['leader'] and not member['admin'] and member['active']:
+                if member['active']:
+                    _userinfo = get_user_details(args.ppms_url, args.api2_key, member['id'])
+                    logger.info(f"userinfo: {_userinfo}")
+                    # get unit id
+                    if _userinfo['unitId']:
+                        for usergroup in usergroups:
+                            if int(usergroup['UnitID']) == int(_userinfo['unitId']):
+                                logger.info(f"usergroup: {usergroup}")
+                                # found the group
+                                _chefName = usergroup['ChefName']
+                                _nameParts = _chefName.split(',')
+                                if len(_nameParts) > 0:
+                                    _chefName = f"{_nameParts[1]} {_nameParts[0]}"
+                                user_emails_file.write(f"{project.get('ProjectRef')},{project.get('ProjectName')}, {_userinfo['email']}, {_userinfo['fullName']}, {_chefName}, {usergroup['UnitName']}\n")
+        # else:
+            # logger.info(f"No RDM -  ignrored")
+    user_emails_file.close()
 
 
 def ad_search_email(ad_connection, basedn, searchFilter, searchScope=ldap.SCOPE_SUBTREE, searchAttribute=["mail"]):
@@ -268,6 +365,15 @@ def main(arguments=sys.argv[1:]):
     ppms_proj_ad.add_argument('--ppms-url', help='PPMS url', default=0, type=str)
     ppms_proj_ad.add_argument('--puma-key', help='PPMS puma key', default=0, type=str)
     ppms_proj_ad.add_argument('--api2-key', help='api2 key', default=0, type=str)
+
+
+    ppms_proj_list = subparsers.add_parser(
+        'proj-list', description='List PPMS projects with users and CIs', help='List PPMS projects with users and CIs',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    ppms_proj_list.set_defaults(func=ppms_proj_list_func)
+    ppms_proj_list.add_argument('--ppms-url', help='PPMS url', default=0, type=str)
+    ppms_proj_list.add_argument('--puma-key', help='PPMS puma key', default=0, type=str)
+    ppms_proj_list.add_argument('--api2-key', help='api2 key', default=0, type=str)
 
 
     args = parser.parse_args(arguments)
