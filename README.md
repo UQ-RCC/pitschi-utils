@@ -6,7 +6,7 @@ python3 -m venv venv
 source venv/bin/activate
 ```
 
-Comment out the first line (python-ldap==3.3.1) if not using ldap
+Comment out the first line (python-ldap>=3.4.0) if not using ldap
 ```
 pip3 install -r requirements.txt
 ```
