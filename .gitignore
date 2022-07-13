@@ -129,6 +129,6 @@ dmypy.json
 .pyre/
 .ppms_emails_to_be_updated.txt
 
-.commands
-.*.csv
-.*.txt
+commands
+*.csv
+*.txt
